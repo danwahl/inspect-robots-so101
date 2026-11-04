@@ -87,7 +87,10 @@ jobs:
           # Exactly the imports the lazy seams perform at runtime.
           import torch
 
+          from huggingface_hub import file_exists
+          from lerobot.configs.policies import PreTrainedConfig
           from lerobot.policies.factory import get_policy_class, make_pre_post_processors
+          from peft import PeftConfig, PeftModel
           from lerobot.robots.so_follower import SOFollower
           from lerobot.robots.so_follower.config_so_follower import SOFollowerRobotConfig
 
@@ -99,6 +102,8 @@ jobs:
           print("lerobot seam OK:", torch.__version__)
           print("  get_policy_class:", get_policy_class)
           print("  make_pre_post_processors:", make_pre_post_processors)
+          print("  PreTrainedConfig:", PreTrainedConfig, "| peft:", PeftConfig, PeftModel)
+          print("  file_exists:", file_exists)
           print("  SOFollower:", SOFollower, "| config:", type(robot_cfg).__name__)
           PY
 

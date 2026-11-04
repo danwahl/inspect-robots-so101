@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Mapping
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -51,6 +52,8 @@ PredictFn = Callable[[LeRobotObs], npt.NDArray[np.floating[Any]]]
 OBS_STATE = "observation.state"
 OBS_IMAGE_PREFIX = "observation.images."
 TASK_KEY = "task"
+# What PEFT saves beside a LoRA adapter's weights.
+ADAPTER_CONFIG = "adapter_config.json"
 
 
 def _batch(obs: LeRobotObs, cameras: tuple[str, ...]) -> dict[str, Any]:
@@ -67,6 +70,48 @@ def _batch(obs: LeRobotObs, cameras: tuple[str, ...]) -> dict[str, Any]:
     return batch
 
 
+def _has_adapter(path: str) -> bool:
+    """Whether the checkpoint at ``path`` (a local directory or a Hub repo) is a PEFT adapter."""
+    if Path(path).is_dir():
+        return (Path(path) / ADAPTER_CONFIG).is_file()
+    from huggingface_hub import file_exists
+
+    return bool(file_exists(path, ADAPTER_CONFIG))
+
+
+def _load_policy(cfg: LeRobotPolicyConfig) -> Any:
+    """The checkpoint's policy, with its LoRA adapter applied if it is one.
+
+    An adapter is loaded the way ``lerobot.policies.factory.make_policy`` loads one:
+    the base weights its ``adapter_config.json`` names, built under the fine-tuned
+    checkpoint's own config, then the adapter on top.
+    """
+    from lerobot.policies.factory import get_policy_class
+
+    policy_cls = get_policy_class(cfg.policy_type)
+    if not _has_adapter(cfg.pretrained_path):
+        return policy_cls.from_pretrained(cfg.pretrained_path)
+    from lerobot.configs.policies import PreTrainedConfig
+    from peft import PeftConfig, PeftModel
+
+    peft_config = PeftConfig.from_pretrained(cfg.pretrained_path)
+    base = policy_cls.from_pretrained(
+        peft_config.base_model_name_or_path,
+        config=PreTrainedConfig.from_pretrained(cfg.pretrained_path),
+        revision=peft_config.revision,
+    )
+    return PeftModel.from_pretrained(base, cfg.pretrained_path, config=peft_config)
+
+
+def _rename_map(preprocessor: Any) -> dict[str, str]:
+    """The observation renaming a checkpoint's saved preprocessor applies, if any."""
+    for step in getattr(preprocessor, "steps", ()):
+        rename = getattr(step, "rename_map", None)
+        if rename:
+            return dict(rename)
+    return {}
+
+
 def _default_predict(cfg: LeRobotPolicyConfig) -> PredictFn:
     """Build an in-process LeRobot inference closure from a pretrained checkpoint.
 
@@ -75,9 +120,9 @@ def _default_predict(cfg: LeRobotPolicyConfig) -> PredictFn:
     postprocess back to native motor units.
     """
     import torch
-    from lerobot.policies.factory import get_policy_class, make_pre_post_processors
+    from lerobot.policies.factory import make_pre_post_processors
 
-    policy = get_policy_class(cfg.policy_type).from_pretrained(cfg.pretrained_path)
+    policy = _load_policy(cfg)
     policy.to(cfg.device)
     policy.eval()  # torch nn.Module inference mode (not Python's eval builtin)
     preprocessor, postprocessor = make_pre_post_processors(
@@ -87,9 +132,15 @@ def _default_predict(cfg: LeRobotPolicyConfig) -> PredictFn:
         postprocessor_overrides={"device_processor": {"device": cfg.device}},
     )
 
+    # A checkpoint trained under a rename_map keeps the policy-side names in its
+    # config and renames the cameras in its saved preprocessor.
+    rename = _rename_map(preprocessor)
     policy_image_features = dict(policy.config.image_features)
     missing = [
-        cam for cam in cfg.cameras if f"{OBS_IMAGE_PREFIX}{cam}" not in policy_image_features
+        cam
+        for cam in cfg.cameras
+        if rename.get(f"{OBS_IMAGE_PREFIX}{cam}", f"{OBS_IMAGE_PREFIX}{cam}")
+        not in policy_image_features
     ]
     if missing:
         raise ValueError(

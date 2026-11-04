@@ -204,8 +204,11 @@ def _install_lerobot_fakes(
     *,
     chunk: np.ndarray,
     image_features: dict[str, Any] | None = None,
+    rename_map: dict[str, str] | None = None,
+    hub_adapter: bool = False,
 ) -> dict[str, Any]:
-    """Install fakes for torch and the lerobot modules the seam imports."""
+    """Install fakes for torch, peft, huggingface_hub and the lerobot modules the seam
+    imports."""
     calls: dict[str, Any] = {}
     if image_features is None:
         image_features = {"observation.images.front": SimpleNamespace(shape=(3, 4, 4))}
@@ -227,8 +230,9 @@ def _install_lerobot_fakes(
 
     class _FakePolicyClass:
         @staticmethod
-        def from_pretrained(path: str) -> _FakePolicy:
+        def from_pretrained(path: str, **kw: Any) -> _FakePolicy:
             calls["from_pretrained"] = path
+            calls["from_pretrained_kwargs"] = kw
             return _FakePolicy()
 
     def get_policy_class(name: str) -> type[_FakePolicyClass]:
@@ -248,7 +252,45 @@ def _install_lerobot_fakes(
             calls.setdefault("postprocessed", []).append(tensor)
             return tensor
 
+        preprocessor.steps = [  # type: ignore[attr-defined]
+            SimpleNamespace(),
+            SimpleNamespace(rename_map=rename_map or {}),
+        ]
         return preprocessor, postprocessor
+
+    class _PeftConfig:
+        base_model_name_or_path = "base/model"
+        revision = "abc123"
+
+        @staticmethod
+        def from_pretrained(path: str) -> _PeftConfig:
+            calls["peft_config_path"] = path
+            return _PeftConfig()
+
+    class _PeftModel:
+        @staticmethod
+        def from_pretrained(base: Any, path: str, config: Any) -> Any:
+            calls["peft_model"] = (base, path, config)
+            return base
+
+    class _PreTrainedConfig:
+        @staticmethod
+        def from_pretrained(path: str) -> str:
+            calls["pretrained_config_path"] = path
+            return f"config of {path}"
+
+    def file_exists(repo: str, filename: str) -> bool:
+        calls["hub_file_exists"] = (repo, filename)
+        return hub_adapter
+
+    peft = ModuleType("peft")
+    peft.PeftConfig = _PeftConfig  # type: ignore[attr-defined]
+    peft.PeftModel = _PeftModel  # type: ignore[attr-defined]
+    hub = ModuleType("huggingface_hub")
+    hub.file_exists = file_exists  # type: ignore[attr-defined]
+    configs = ModuleType("lerobot.configs")
+    configs_policies = ModuleType("lerobot.configs.policies")
+    configs_policies.PreTrainedConfig = _PreTrainedConfig  # type: ignore[attr-defined]
 
     torch_mod = ModuleType("torch")
     torch_mod.no_grad = nullcontext  # type: ignore[attr-defined]
@@ -266,9 +308,15 @@ def _install_lerobot_fakes(
     factory.make_pre_post_processors = make_pre_post_processors  # type: ignore[attr-defined]
     lerobot.policies = policies  # type: ignore[attr-defined]
     policies.factory = factory  # type: ignore[attr-defined]
+    lerobot.configs = configs  # type: ignore[attr-defined]
+    configs.policies = configs_policies  # type: ignore[attr-defined]
 
     modules = {
         "torch": torch_mod,
+        "peft": peft,
+        "huggingface_hub": hub,
+        "lerobot.configs": configs,
+        "lerobot.configs.policies": configs_policies,
         "lerobot": lerobot,
         "lerobot.policies": policies,
         "lerobot.policies.factory": factory,
@@ -292,6 +340,8 @@ def test_default_predict_wires_lerobot(monkeypatch: pytest.MonkeyPatch) -> None:
     # Model load: factory class + from_pretrained + device + eval.
     assert calls["policy_types"] == ["smolvla"]
     assert calls["from_pretrained"] == "lerobot/smolvla_base"
+    assert calls["hub_file_exists"] == ("lerobot/smolvla_base", "adapter_config.json")
+    assert "peft_model" not in calls
     assert calls["to_device"] == "cpu"
     assert calls["eval"] is True
     # Processor pipelines built from the loaded policy's config with device overrides.
@@ -348,3 +398,55 @@ def test_default_predict_rejects_camera_feature_mismatch(
     pol.reset(Scene(id="s", instruction="x"))
     with pytest.raises(ValueError, match=r"do not cover configured camera\(s\) \['front'\]"):
         pol.act(_obs())
+
+
+def test_default_predict_loads_adapter_onto_base(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    (tmp_path / "adapter_config.json").write_text("{}")
+    calls = _install_lerobot_fakes(monkeypatch, chunk=np.ones((1, 2, 6)))
+    pol = LeRobotPolicy(_seam_cfg(pretrained_path=str(tmp_path)))
+    pol.reset(Scene(id="s", instruction="x"))
+    pol.act(_obs())
+    # The base weights the adapter names, under the fine-tuned checkpoint's config.
+    assert calls["from_pretrained"] == "base/model"
+    assert calls["from_pretrained_kwargs"] == {
+        "config": f"config of {tmp_path}",
+        "revision": "abc123",
+    }
+    _, path, _ = calls["peft_model"]
+    assert path == str(tmp_path)
+    assert calls["processors_path"] == str(tmp_path)
+
+
+def test_default_predict_local_dir_without_adapter(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    calls = _install_lerobot_fakes(monkeypatch, chunk=np.ones((1, 2, 6)))
+    pol = LeRobotPolicy(_seam_cfg(pretrained_path=str(tmp_path)))
+    pol.reset(Scene(id="s", instruction="x"))
+    pol.act(_obs())
+    assert calls["from_pretrained"] == str(tmp_path)
+    assert "hub_file_exists" not in calls and "peft_model" not in calls
+
+
+def test_default_predict_detects_hub_adapter(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _install_lerobot_fakes(monkeypatch, chunk=np.ones((1, 2, 6)), hub_adapter=True)
+    pol = LeRobotPolicy(_seam_cfg(pretrained_path="me/adapter"))
+    pol.reset(Scene(id="s", instruction="x"))
+    pol.act(_obs())
+    assert calls["peft_config_path"] == "me/adapter"
+    assert calls["from_pretrained"] == "base/model"
+
+
+def test_default_predict_accepts_renamed_cameras(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The checkpoint calls the camera "base_0_rgb"; its preprocessor renames "front".
+    _install_lerobot_fakes(
+        monkeypatch,
+        chunk=np.ones((1, 2, 6)),
+        image_features={"observation.images.base_0_rgb": SimpleNamespace(shape=(3, 4, 4))},
+        rename_map={"observation.images.front": "observation.images.base_0_rgb"},
+    )
+    pol = LeRobotPolicy(_seam_cfg())
+    pol.reset(Scene(id="s", instruction="x"))
+    assert len(pol.act(_obs())) == 2

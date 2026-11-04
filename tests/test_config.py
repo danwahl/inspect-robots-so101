@@ -91,6 +91,18 @@ def test_settle_config_validation(kwargs: dict[str, object], message: str) -> No
         SOArmConfig(**kwargs)
 
 
+def test_from_kwargs_splits_tuple_strings() -> None:
+    cfg = LeRobotPolicyConfig.from_kwargs(cameras="top, wrist")
+    assert cfg.cameras == ("top", "wrist")
+    arm = SOArmConfig.from_kwargs(joint_low="-90,-90,-90,-90,-90,0")
+    assert arm.joint_low == (-90.0,) * 5 + (0.0,)
+
+
+def test_from_kwargs_keeps_tuples() -> None:
+    cfg = LeRobotPolicyConfig.from_kwargs(cameras=("top",))
+    assert cfg.cameras == ("top",)
+
+
 def test_from_kwargs_rejects_unknown() -> None:
     with pytest.raises(TypeError, match="unexpected config keys"):
         LeRobotPolicyConfig.from_kwargs(nope=1)

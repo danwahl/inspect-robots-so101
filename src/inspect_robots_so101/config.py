@@ -52,10 +52,21 @@ class _FromKwargs:
 
     @classmethod
     def from_kwargs(cls: type[_T], **flat: Any) -> _T:
-        names = {f.name for f in dataclasses.fields(cls)}  # type: ignore[arg-type]
-        unknown = set(flat) - names
+        """Build the config from CLI scalars.
+
+        A tuple field given a string takes it as comma-separated items, each cast to
+        the type of the default's items (``cameras=top,wrist``,
+        ``joint_low=-90,-90,-90,-90,-90,0``).
+        """
+        fields = {f.name: f for f in dataclasses.fields(cls)}  # type: ignore[arg-type]
+        unknown = set(flat) - set(fields)
         if unknown:
             raise TypeError(f"{cls.__name__} got unexpected config keys: {sorted(unknown)}")
+        for name, value in flat.items():
+            default = fields[name].default
+            if isinstance(default, tuple) and isinstance(value, str):
+                item = type(default[0]) if default else str
+                flat[name] = tuple(item(v.strip()) for v in value.split(",") if v.strip())
         return cls(**flat)
 
 

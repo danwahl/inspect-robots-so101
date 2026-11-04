@@ -204,9 +204,8 @@ def _install_lerobot_fakes(
     *,
     chunk: np.ndarray,
     image_features: dict[str, Any] | None = None,
-    feature_layout: str = "v060",
 ) -> dict[str, Any]:
-    """Install fakes for the v0.6.0, v0.5.1, or v0.5.0 feature layout."""
+    """Install fakes for torch and the lerobot modules the seam imports."""
     calls: dict[str, Any] = {}
     if image_features is None:
         image_features = {"observation.images.front": SimpleNamespace(shape=(3, 4, 4))}
@@ -251,18 +250,6 @@ def _install_lerobot_fakes(
 
         return preprocessor, postprocessor
 
-    def hw_to_dataset_features(hw: Any, prefix: str, use_video: bool = True) -> Any:
-        calls["hw_features"] = hw
-        calls["hw_prefix"] = prefix
-        calls["hw_use_video"] = use_video
-        return {"observation.state": {"names": [k for k in hw if k.endswith(".pos")]}}
-
-    def raw_observation_to_observation(raw: Any, feats: Any, img_feats: Any) -> Any:
-        calls["raw_obs"] = raw
-        calls["raw_features"] = feats
-        calls["raw_image_features"] = img_feats
-        return {"prepared": True}
-
     torch_mod = ModuleType("torch")
     torch_mod.no_grad = nullcontext  # type: ignore[attr-defined]
 
@@ -270,63 +257,22 @@ def _install_lerobot_fakes(
         return FakeTensor(np.stack([t.arr for t in tensors], axis=dim))
 
     torch_mod.stack = _stack  # type: ignore[attr-defined]
+    torch_mod.from_numpy = lambda arr: arr  # type: ignore[attr-defined]
 
     lerobot = ModuleType("lerobot")
     policies = ModuleType("lerobot.policies")
     factory = ModuleType("lerobot.policies.factory")
     factory.get_policy_class = get_policy_class  # type: ignore[attr-defined]
     factory.make_pre_post_processors = make_pre_post_processors  # type: ignore[attr-defined]
-    async_inference = ModuleType("lerobot.async_inference")
-    helpers = ModuleType("lerobot.async_inference.helpers")
-    helpers.raw_observation_to_observation = raw_observation_to_observation  # type: ignore[attr-defined]
-    datasets = ModuleType("lerobot.datasets")
     lerobot.policies = policies  # type: ignore[attr-defined]
     policies.factory = factory  # type: ignore[attr-defined]
-    lerobot.async_inference = async_inference  # type: ignore[attr-defined]
-    async_inference.helpers = helpers  # type: ignore[attr-defined]
-    lerobot.datasets = datasets  # type: ignore[attr-defined]
 
     modules = {
         "torch": torch_mod,
         "lerobot": lerobot,
         "lerobot.policies": policies,
         "lerobot.policies.factory": factory,
-        "lerobot.async_inference": async_inference,
-        "lerobot.async_inference.helpers": helpers,
-        "lerobot.datasets": datasets,
     }
-    if feature_layout == "v060":
-        # lerobot >= 0.6.0: hw_to_dataset_features lives in lerobot.utils.feature_utils.
-        monkeypatch.delitem(sys.modules, "lerobot.datasets.feature_utils", raising=False)
-        monkeypatch.delitem(sys.modules, "lerobot.datasets.utils", raising=False)
-        utils = ModuleType("lerobot.utils")
-        feature_utils_mod = ModuleType("lerobot.utils.feature_utils")
-        feature_utils_mod.hw_to_dataset_features = hw_to_dataset_features  # type: ignore[attr-defined]
-        utils.feature_utils = feature_utils_mod  # type: ignore[attr-defined]
-        lerobot.utils = utils  # type: ignore[attr-defined]
-        modules["lerobot.utils"] = utils
-        modules["lerobot.utils.feature_utils"] = feature_utils_mod
-    elif feature_layout == "v051":
-        # lerobot 0.5.1 - 0.5.x: the helper moved to datasets.feature_utils.
-        monkeypatch.delitem(sys.modules, "lerobot.utils.feature_utils", raising=False)
-        monkeypatch.delitem(sys.modules, "lerobot.utils", raising=False)
-        feature_utils_mod = ModuleType("lerobot.datasets.feature_utils")
-        feature_utils_mod.hw_to_dataset_features = hw_to_dataset_features  # type: ignore[attr-defined]
-        datasets.feature_utils = feature_utils_mod  # type: ignore[attr-defined]
-        modules["lerobot.datasets.feature_utils"] = feature_utils_mod
-    elif feature_layout == "v050":
-        # lerobot == 0.5.0 layout: hw_to_dataset_features in lerobot.datasets.utils
-        # and NO feature_utils module (the import must raise ImportError).
-        monkeypatch.delitem(sys.modules, "lerobot.utils.feature_utils", raising=False)
-        monkeypatch.delitem(sys.modules, "lerobot.utils", raising=False)
-        monkeypatch.delitem(sys.modules, "lerobot.datasets.feature_utils", raising=False)
-        utils_mod = ModuleType("lerobot.datasets.utils")
-        utils_mod.hw_to_dataset_features = hw_to_dataset_features  # type: ignore[attr-defined]
-        datasets.utils = utils_mod  # type: ignore[attr-defined]
-        modules["lerobot.datasets.utils"] = utils_mod
-    else:
-        raise ValueError(f"unknown feature layout: {feature_layout}")
-
     for name, mod in modules.items():
         monkeypatch.setitem(sys.modules, name, mod)
     return calls
@@ -355,24 +301,15 @@ def test_default_predict_wires_lerobot(monkeypatch: pytest.MonkeyPatch) -> None:
         "preprocessor_overrides": {"device_processor": {"device": "cpu"}},
         "postprocessor_overrides": {"device_processor": {"device": "cpu"}},
     }
-    # lerobot_features synthesized from packing.MOTORS + cfg cameras (no robot object).
-    hw = calls["hw_features"]
-    assert [k for k in hw if k.endswith(".pos")] == list(packing.motor_keys())
-    assert all(hw[k] is float for k in packing.motor_keys())
-    assert hw["front"] == (4, 4, 3)
-    assert calls["hw_prefix"] == "observation"
-    assert calls["hw_use_video"] is False
-    # Obs prep delegated to lerobot's raw_observation_to_observation with the raw
-    # payload, the synthesized features, and the checkpoint's image features.
-    raw = calls["raw_obs"]
-    assert raw["task"] == "grab it"
-    assert [raw[k] for k in packing.motor_keys()] == [0.0] * 6
-    assert raw["front"].shape == (4, 4, 3)
-    assert calls["raw_features"] == {"observation.state": {"names": list(packing.motor_keys())}}
-    assert calls["raw_image_features"] == calls["policy_config"].image_features
-    # Prepared obs -> preprocessor -> predict_action_chunk -> per-step postprocess.
-    assert calls["preprocessed"] == {"prepared": True}
-    assert calls["predict_batch"] == {"batch": {"prepared": True}}
+    # The raw payload packed into the batch the preprocessor takes: state in motor
+    # order, each camera as float CHW in 0..1 under observation.images.<cam>, task.
+    batch = calls["preprocessed"]
+    assert batch["task"] == "grab it"
+    assert batch["observation.state"].shape == (1, 6)
+    assert batch["observation.state"].dtype == np.float32
+    image = batch["observation.images.front"]
+    assert image.shape == (1, 3, 4, 4) and image.dtype == np.float32
+    assert calls["predict_batch"] == {"batch": batch}
     assert len(calls["postprocessed"]) == 2
     assert len(out) == 2
     assert np.array_equal(out.actions[0].data, chunk[0, 0])
@@ -411,29 +348,3 @@ def test_default_predict_rejects_camera_feature_mismatch(
     pol.reset(Scene(id="s", instruction="x"))
     with pytest.raises(ValueError, match=r"do not cover configured camera\(s\) \['front'\]"):
         pol.act(_obs())
-
-
-def test_default_predict_hw_features_fallback_import(monkeypatch: pytest.MonkeyPatch) -> None:
-    # lerobot 0.5.0 layout: no lerobot.datasets.feature_utils -> fall back to
-    # lerobot.datasets.utils.
-    calls = _install_lerobot_fakes(monkeypatch, chunk=np.ones((1, 2, 6)), feature_layout="v050")
-    pol = LeRobotPolicy(_seam_cfg())
-    pol.reset(Scene(id="s", instruction="x"))
-    out = pol.act(_obs())
-    assert len(out) == 2
-    assert calls["hw_prefix"] == "observation"
-
-
-def test_default_predict_hw_features_v051_fallback_import(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls = _install_lerobot_fakes(
-        monkeypatch,
-        chunk=np.ones((1, 2, 6)),
-        feature_layout="v051",
-    )
-    pol = LeRobotPolicy(_seam_cfg())
-    pol.reset(Scene(id="s", instruction="x"))
-    out = pol.act(_obs())
-    assert len(out) == 2
-    assert calls["hw_prefix"] == "observation"

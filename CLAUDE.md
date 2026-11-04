@@ -15,7 +15,7 @@ Inspect Robots evals swap two inputs: a `Policy` (VLA brain) and an `Embodiment`
 body + world). We ship both for one real stack:
 
 - **`lerobot` policy** — wraps a LeRobot checkpoint (ACT / SmolVLA / π0 / …) and
-  runs it **in process** (`raw_observation_to_observation` + the model's pre/post
+  runs it **in process** (a packed batch + the model's pre/post
   processors + `predict_action_chunk`). Unlike YAM/MolmoAct2 (a separate HTTP
   server), LeRobot models are a library you import — so torch + lerobot + the
   checkpoint live behind **one injectable seam**, `LeRobotPolicy(predict_fn=...)`,

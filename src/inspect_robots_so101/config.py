@@ -191,6 +191,10 @@ class LeRobotPolicyConfig(_FromKwargs):
     # Must match SOArmConfig.use_degrees so the policy's declared observation
     # contract reflects the motor positions it receives.
     use_degrees: bool = True
+    # Stitch each chunk onto the unexecuted tail of the one before it with Real-Time
+    # Chunking, guiding the next denoise over ``chunk_size`` steps. Needs a policy whose
+    # ``supports_rtc()`` is true (pi0, pi0.5, SmolVLA).
+    rtc: bool = False
 
     def __post_init__(self) -> None:
         if self.chunk_size < 1:

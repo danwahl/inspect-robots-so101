@@ -84,20 +84,30 @@ def _load_policy(cfg: LeRobotPolicyConfig) -> Any:
 
     An adapter is loaded the way ``lerobot.policies.factory.make_policy`` loads one:
     the base weights its ``adapter_config.json`` names, built under the fine-tuned
-    checkpoint's own config, then the adapter on top.
+    checkpoint's own config, then the adapter on top. ``cfg.rtc`` sets that config's
+    ``rtc_config`` first, since a policy builds its RTC processor at construction.
     """
     from lerobot.policies.factory import get_policy_class
 
     policy_cls = get_policy_class(cfg.policy_type)
-    if not _has_adapter(cfg.pretrained_path):
+    adapter = _has_adapter(cfg.pretrained_path)
+    if not adapter and not cfg.rtc:
         return policy_cls.from_pretrained(cfg.pretrained_path)
     from lerobot.configs.policies import PreTrainedConfig
+
+    config = PreTrainedConfig.from_pretrained(cfg.pretrained_path)
+    if cfg.rtc:
+        from lerobot.policies.rtc.configuration_rtc import RTCConfig
+
+        config.rtc_config = RTCConfig(execution_horizon=cfg.chunk_size)
+    if not adapter:
+        return policy_cls.from_pretrained(cfg.pretrained_path, config=config)
     from peft import PeftConfig, PeftModel
 
     peft_config = PeftConfig.from_pretrained(cfg.pretrained_path)
     base = policy_cls.from_pretrained(
         peft_config.base_model_name_or_path,
-        config=PreTrainedConfig.from_pretrained(cfg.pretrained_path),
+        config=config,
         revision=peft_config.revision,
     )
     return PeftModel.from_pretrained(base, cfg.pretrained_path, config=peft_config)
@@ -112,17 +122,64 @@ def _rename_map(preprocessor: Any) -> dict[str, str]:
     return {}
 
 
-def _default_predict(cfg: LeRobotPolicyConfig) -> PredictFn:
-    """Build an in-process LeRobot inference closure from a pretrained checkpoint.
+class _Inference:
+    """In-process LeRobot inference: pack the batch → preprocess →
+    ``predict_action_chunk`` → postprocess back to native motor units.
 
-    Load the policy class from the factory, build the matching pre/post-processor
-    pipelines, then per call pack the batch → preprocess → ``predict_action_chunk`` →
-    postprocess back to native motor units.
+    Under ``cfg.rtc`` it keeps the normalized tail of each chunk past the
+    ``chunk_size`` actions executed, and guides the next chunk onto it; ``reset``
+    drops that tail at the start of a trial.
     """
-    import torch
+
+    def __init__(
+        self, cfg: LeRobotPolicyConfig, policy: Any, preprocessor: Any, postprocessor: Any
+    ):
+        self._cfg = cfg
+        self._policy = policy
+        self._preprocessor = preprocessor
+        self._postprocessor = postprocessor
+        self._leftover: Any = None
+
+    def reset(self) -> None:
+        self._leftover = None
+
+    def __call__(self, obs: LeRobotObs) -> npt.NDArray[np.floating[Any]]:
+        import torch
+
+        cfg = self._cfg
+        observation = {
+            k: torch.from_numpy(v) if isinstance(v, np.ndarray) else v
+            for k, v in _batch(obs, cfg.cameras).items()
+        }
+        batch = self._preprocessor(observation)
+        with torch.no_grad():
+            if cfg.rtc:
+                chunk = self._policy.predict_action_chunk(
+                    batch,
+                    prev_chunk_left_over=self._leftover,
+                    inference_delay=0,
+                    execution_horizon=cfg.chunk_size,
+                )
+            else:
+                chunk = self._policy.predict_action_chunk(batch)
+        if chunk.ndim == 2:
+            chunk = chunk.unsqueeze(0)
+        if cfg.rtc:
+            self._leftover = chunk[:, cfg.chunk_size :]
+        out = torch.stack(
+            [self._postprocessor(chunk[:, i, :]) for i in range(chunk.shape[1])], dim=1
+        ).squeeze(0)
+        return out.detach().cpu().numpy()  # type: ignore[no-any-return]
+
+
+def _default_predict(cfg: LeRobotPolicyConfig) -> _Inference:
+    """Build in-process LeRobot inference from a pretrained checkpoint: the policy from
+    the factory and the pre/post-processor pipelines saved beside it."""
     from lerobot.policies.factory import make_pre_post_processors
 
     policy = _load_policy(cfg)
+    if cfg.rtc and not policy.supports_rtc():
+        raise ValueError(f"rtc=true needs a policy that supports RTC; {cfg.policy_type!r} does not")
     policy.to(cfg.device)
     policy.eval()  # torch nn.Module inference mode (not Python's eval builtin)
     preprocessor, postprocessor = make_pre_post_processors(
@@ -149,23 +206,7 @@ def _default_predict(cfg: LeRobotPolicyConfig) -> PredictFn:
             f"{missing} (expected {[OBS_IMAGE_PREFIX + cam for cam in missing]}); "
             "set LeRobotPolicyConfig.cameras to the camera names the checkpoint expects"
         )
-
-    def _predict(obs: LeRobotObs) -> npt.NDArray[np.floating[Any]]:
-        observation = {
-            k: torch.from_numpy(v) if isinstance(v, np.ndarray) else v
-            for k, v in _batch(obs, cfg.cameras).items()
-        }
-        batch = preprocessor(observation)
-        with torch.no_grad():
-            chunk = policy.predict_action_chunk(batch)
-        if chunk.ndim == 2:
-            chunk = chunk.unsqueeze(0)
-        out = torch.stack(
-            [postprocessor(chunk[:, i, :]) for i in range(chunk.shape[1])], dim=1
-        ).squeeze(0)
-        return out.detach().cpu().numpy()  # type: ignore[no-any-return]
-
-    return _predict
+    return _Inference(cfg, policy, preprocessor, postprocessor)
 
 
 class LeRobotPolicy:
@@ -204,9 +245,13 @@ class LeRobotPolicy:
         return self._predict_fn
 
     def reset(self, scene: Scene) -> None:
-        """Stash the scene's instruction (fed to the VLA verbatim)."""
+        """Stash the scene's instruction (fed to the VLA verbatim), and drop any chunk
+        a stitching predict_fn carries over from the last trial."""
         self._instruction = scene.instruction
         self.num_inferences = 0
+        reset = getattr(self._predict_fn, "reset", None)
+        if reset is not None:
+            reset()
 
     def act(self, observation: Observation) -> ActionChunk:
         """Build the raw robot-style observation, run inference, return the chunk.

@@ -206,6 +206,7 @@ def _install_lerobot_fakes(
     image_features: dict[str, Any] | None = None,
     rename_map: dict[str, str] | None = None,
     hub_adapter: bool = False,
+    supports_rtc: bool = True,
 ) -> dict[str, Any]:
     """Install fakes for torch, peft, huggingface_hub and the lerobot modules the seam
     imports."""
@@ -224,8 +225,12 @@ def _install_lerobot_fakes(
         def eval(self) -> None:
             calls["eval"] = True
 
-        def predict_action_chunk(self, batch: Any) -> FakeTensor:
+        def supports_rtc(self) -> bool:
+            return supports_rtc
+
+        def predict_action_chunk(self, batch: Any, **kw: Any) -> FakeTensor:
             calls["predict_batch"] = batch
+            calls.setdefault("predict_kwargs", []).append(kw)
             return FakeTensor(chunk)
 
     class _FakePolicyClass:
@@ -275,9 +280,9 @@ def _install_lerobot_fakes(
 
     class _PreTrainedConfig:
         @staticmethod
-        def from_pretrained(path: str) -> str:
+        def from_pretrained(path: str) -> SimpleNamespace:
             calls["pretrained_config_path"] = path
-            return f"config of {path}"
+            return SimpleNamespace(path=path)
 
     def file_exists(repo: str, filename: str) -> bool:
         calls["hub_file_exists"] = (repo, filename)
@@ -291,6 +296,9 @@ def _install_lerobot_fakes(
     configs = ModuleType("lerobot.configs")
     configs_policies = ModuleType("lerobot.configs.policies")
     configs_policies.PreTrainedConfig = _PreTrainedConfig  # type: ignore[attr-defined]
+    rtc = ModuleType("lerobot.policies.rtc")
+    rtc_config = ModuleType("lerobot.policies.rtc.configuration_rtc")
+    rtc_config.RTCConfig = lambda **kw: SimpleNamespace(**kw)  # type: ignore[attr-defined]
 
     torch_mod = ModuleType("torch")
     torch_mod.no_grad = nullcontext  # type: ignore[attr-defined]
@@ -320,6 +328,8 @@ def _install_lerobot_fakes(
         "lerobot": lerobot,
         "lerobot.policies": policies,
         "lerobot.policies.factory": factory,
+        "lerobot.policies.rtc": rtc,
+        "lerobot.policies.rtc.configuration_rtc": rtc_config,
     }
     for name, mod in modules.items():
         monkeypatch.setitem(sys.modules, name, mod)
@@ -411,7 +421,7 @@ def test_default_predict_loads_adapter_onto_base(
     # The base weights the adapter names, under the fine-tuned checkpoint's config.
     assert calls["from_pretrained"] == "base/model"
     assert calls["from_pretrained_kwargs"] == {
-        "config": f"config of {tmp_path}",
+        "config": SimpleNamespace(path=str(tmp_path)),
         "revision": "abc123",
     }
     _, path, _ = calls["peft_model"]
@@ -450,3 +460,38 @@ def test_default_predict_accepts_renamed_cameras(monkeypatch: pytest.MonkeyPatch
     pol = LeRobotPolicy(_seam_cfg())
     pol.reset(Scene(id="s", instruction="x"))
     assert len(pol.act(_obs())) == 2
+
+
+def test_default_predict_stitches_chunks_with_rtc(monkeypatch: pytest.MonkeyPatch) -> None:
+    chunk = np.arange(1 * 5 * 6, dtype=float).reshape(1, 5, 6)
+    calls = _install_lerobot_fakes(monkeypatch, chunk=chunk)
+    pol = LeRobotPolicy(_seam_cfg(rtc=True, chunk_size=2))
+    pol.reset(Scene(id="s", instruction="x"))
+    assert len(pol.act(_obs())) == 2
+    pol.act(_obs())
+    # The checkpoint's config is built with RTC over the executed horizon.
+    assert calls["from_pretrained_kwargs"]["config"].rtc_config.execution_horizon == 2
+    first, second = calls["predict_kwargs"]
+    assert first == {"prev_chunk_left_over": None, "inference_delay": 0, "execution_horizon": 2}
+    # The next chunk is guided onto the three actions the first one left unexecuted.
+    assert np.array_equal(second["prev_chunk_left_over"].arr, chunk[:, 2:])
+    # A new trial starts unguided.
+    pol.reset(Scene(id="t", instruction="x"))
+    pol.act(_obs())
+    assert calls["predict_kwargs"][2]["prev_chunk_left_over"] is None
+
+
+def test_default_predict_without_rtc_passes_no_guidance(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _install_lerobot_fakes(monkeypatch, chunk=np.ones((1, 2, 6)))
+    pol = LeRobotPolicy(_seam_cfg())
+    pol.reset(Scene(id="s", instruction="x"))
+    pol.act(_obs())
+    assert calls["predict_kwargs"] == [{}]
+
+
+def test_default_predict_rejects_rtc_without_support(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_lerobot_fakes(monkeypatch, chunk=np.ones((1, 2, 6)), supports_rtc=False)
+    pol = LeRobotPolicy(_seam_cfg(rtc=True))
+    pol.reset(Scene(id="s", instruction="x"))
+    with pytest.raises(ValueError, match="needs a policy that supports RTC"):
+        pol.act(_obs())

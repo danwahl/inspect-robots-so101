@@ -17,6 +17,7 @@ from typing import Any
 import numpy as np
 import pytest
 from inspect_robots.scene import Scene
+from inspect_robots.task import TaskEnvelope
 from inspect_robots.types import Observation
 
 from inspect_robots_so101 import packing
@@ -394,6 +395,16 @@ def test_default_predict_built_once(monkeypatch: pytest.MonkeyPatch) -> None:
     pol.act(_obs())
     assert calls["policy_types"] == ["smolvla"]  # lazy closure built exactly once
     assert pol.num_inferences == 2
+
+
+def test_bind_task_loads_before_the_first_trial(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _install_lerobot_fakes(monkeypatch, chunk=np.ones((1, 2, 6)))
+    pol = LeRobotPolicy(_seam_cfg())
+    pol.bind_task(TaskEnvelope(name="t", max_steps=10))
+    assert calls["policy_types"] == ["smolvla"]
+    pol.reset(Scene(id="s", instruction="x"))
+    pol.act(_obs())
+    assert calls["policy_types"] == ["smolvla"]  # not loaded again
 
 
 def test_default_predict_rejects_camera_feature_mismatch(

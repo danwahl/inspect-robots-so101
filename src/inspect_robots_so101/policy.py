@@ -34,6 +34,7 @@ import numpy as np
 import numpy.typing as npt
 from inspect_robots.policy import PolicyConfig, PolicyInfo
 from inspect_robots.scene import Scene
+from inspect_robots.task import TaskEnvelope
 from inspect_robots.types import Action, ActionChunk, Observation
 
 from inspect_robots_so101 import packing
@@ -243,6 +244,12 @@ class LeRobotPolicy:
         if self._predict_fn is None:
             self._predict_fn = _default_predict(self._cfg)
         return self._predict_fn
+
+    def bind_task(self, envelope: TaskEnvelope) -> None:
+        """Load the checkpoint before the first trial, so one that cannot load fails
+        the run once instead of erroring every trial. ``eval()`` calls this; a direct
+        ``rollout()`` loads on the first ``act``."""
+        self._predict()
 
     def reset(self, scene: Scene) -> None:
         """Stash the scene's instruction (fed to the VLA verbatim), and drop any chunk

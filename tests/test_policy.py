@@ -63,6 +63,8 @@ def test_info_and_config_zero_arg() -> None:
     assert pol.info.control_hz is None  # load-bearing: keeps compat warning-free
     assert pol.info.observation_space.state_keys == frozenset({"joint_pos"})
     assert pol.config.action_horizon == 50
+    assert pol.config.rtc is False
+    assert pol.info.checkpoint == "lerobot/smolvla_base"
 
 
 def test_normalized_info_declares_normalized_state() -> None:

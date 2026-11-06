@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -210,6 +211,14 @@ def _default_predict(cfg: LeRobotPolicyConfig) -> _Inference:
     return _Inference(cfg, policy, preprocessor, postprocessor)
 
 
+@dataclass(frozen=True)
+class LeRobotInferenceConfig(PolicyConfig):
+    """``PolicyConfig`` plus the inference settings it has no field for. ``eval()``
+    records the policy config in the log, so these land there too."""
+
+    rtc: bool = False
+
+
 class LeRobotPolicy:
     """Inspect Robots policy wrapping a LeRobot checkpoint for the SO-ARM action space."""
 
@@ -236,8 +245,9 @@ class LeRobotPolicy:
             # Intentionally None: advertising a rate would trip a (harmless) compat
             # control_rate warning. The embodiment paces the rollout.
             control_hz=None,
+            checkpoint=self._cfg.pretrained_path,
         )
-        self.config = PolicyConfig(action_horizon=self._cfg.chunk_size)
+        self.config = LeRobotInferenceConfig(action_horizon=self._cfg.chunk_size, rtc=self._cfg.rtc)
 
     def _predict(self) -> PredictFn:
         """Lazily build the real inference closure on first use."""

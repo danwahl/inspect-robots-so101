@@ -195,6 +195,9 @@ class LeRobotPolicyConfig(_FromKwargs):
     # Chunking, guiding the next denoise over ``chunk_size`` steps. Needs a policy whose
     # ``supports_rtc()`` is true (pi0, pi0.5, SmolVLA).
     rtc: bool = False
+    # Read each whole chunk back off a shape-preserving cubic through some of its steps
+    # before truncating it, which drops the step-to-step wobble (see ``smoothing``).
+    smooth: bool = False
 
     def __post_init__(self) -> None:
         if self.chunk_size < 1:

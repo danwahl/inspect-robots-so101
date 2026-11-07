@@ -23,6 +23,7 @@ from inspect_robots.types import Observation
 from inspect_robots_so101 import packing
 from inspect_robots_so101.config import LeRobotPolicyConfig
 from inspect_robots_so101.policy import LeRobotPolicy
+from inspect_robots_so101.smoothing import smooth
 
 
 def _policy_cfg(**over: Any) -> LeRobotPolicyConfig:
@@ -64,6 +65,7 @@ def test_info_and_config_zero_arg() -> None:
     assert pol.info.observation_space.state_keys == frozenset({"joint_pos"})
     assert pol.config.action_horizon == 50
     assert pol.config.rtc is False
+    assert pol.config.smooth is False
     assert pol.info.checkpoint == "lerobot/smolvla_base"
 
 
@@ -508,3 +510,12 @@ def test_default_predict_rejects_rtc_without_support(monkeypatch: pytest.MonkeyP
     pol.reset(Scene(id="s", instruction="x"))
     with pytest.raises(ValueError, match="needs a policy that supports RTC"):
         pol.act(_obs())
+
+
+def test_smooth_reads_the_whole_chunk_off_the_cubic_before_truncating() -> None:
+    chunk = np.random.default_rng(0).normal(size=(50, 6))
+    pol = LeRobotPolicy(_policy_cfg(smooth=True, chunk_size=10), predict_fn=lambda obs: chunk)
+    pol.reset(Scene(id="s", instruction="x"))
+    out = np.array([a.data for a in pol.act(_obs()).actions])
+    assert pol.config.smooth is True
+    assert np.allclose(out, smooth(chunk)[:10])

@@ -40,6 +40,7 @@ from inspect_robots.types import Action, ActionChunk, Observation
 
 from inspect_robots_so101 import packing
 from inspect_robots_so101.config import LeRobotPolicyConfig, action_box, observation_space
+from inspect_robots_so101.smoothing import smooth
 
 # A RAW robot-style observation dict -> an (N, action_dim) action-chunk array.
 # Keys: "<motor>.pos" floats (packing.motor_keys()), camera frames keyed by the
@@ -217,6 +218,7 @@ class LeRobotInferenceConfig(PolicyConfig):
     records the policy config in the log, so these land there too."""
 
     rtc: bool = False
+    smooth: bool = False
 
 
 class LeRobotPolicy:
@@ -247,7 +249,9 @@ class LeRobotPolicy:
             control_hz=None,
             checkpoint=self._cfg.pretrained_path,
         )
-        self.config = LeRobotInferenceConfig(action_horizon=self._cfg.chunk_size, rtc=self._cfg.rtc)
+        self.config = LeRobotInferenceConfig(
+            action_horizon=self._cfg.chunk_size, rtc=self._cfg.rtc, smooth=self._cfg.smooth
+        )
 
     def _predict(self) -> PredictFn:
         """Lazily build the real inference closure on first use."""
@@ -273,7 +277,8 @@ class LeRobotPolicy:
     def act(self, observation: Observation) -> ActionChunk:
         """Build the raw robot-style observation, run inference, return the chunk.
 
-        The chunk is truncated to the first ``chunk_size`` actions (see
+        The chunk is smoothed whole under ``smooth``, so the actions executed sit inside
+        the curve, then truncated to the first ``chunk_size`` actions (see
         ``LeRobotPolicyConfig.chunk_size``).
         """
         cfg = self._cfg
@@ -309,6 +314,8 @@ class LeRobotPolicy:
             )
         if actions.shape[0] == 0:
             raise ValueError("policy returned an empty action chunk")
+        if cfg.smooth:
+            actions = smooth(actions)
         actions = actions[: cfg.chunk_size]
 
         self.num_inferences += 1

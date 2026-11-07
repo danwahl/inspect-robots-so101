@@ -17,11 +17,13 @@ from typing import Any
 import numpy as np
 import pytest
 from inspect_robots.scene import Scene
+from inspect_robots.task import TaskEnvelope
 from inspect_robots.types import Observation
 
 from inspect_robots_so101 import packing
 from inspect_robots_so101.config import LeRobotPolicyConfig
 from inspect_robots_so101.policy import LeRobotPolicy
+from inspect_robots_so101.smoothing import smooth
 
 
 def _policy_cfg(**over: Any) -> LeRobotPolicyConfig:
@@ -62,6 +64,9 @@ def test_info_and_config_zero_arg() -> None:
     assert pol.info.control_hz is None  # load-bearing: keeps compat warning-free
     assert pol.info.observation_space.state_keys == frozenset({"joint_pos"})
     assert pol.config.action_horizon == 50
+    assert pol.config.rtc is False
+    assert pol.config.smooth is True
+    assert pol.info.checkpoint == "lerobot/smolvla_base"
 
 
 def test_normalized_info_declares_normalized_state() -> None:
@@ -204,9 +209,12 @@ def _install_lerobot_fakes(
     *,
     chunk: np.ndarray,
     image_features: dict[str, Any] | None = None,
-    feature_layout: str = "v060",
+    rename_map: dict[str, str] | None = None,
+    hub_adapter: bool = False,
+    supports_rtc: bool = True,
 ) -> dict[str, Any]:
-    """Install fakes for the v0.6.0, v0.5.1, or v0.5.0 feature layout."""
+    """Install fakes for torch, peft, huggingface_hub and the lerobot modules the seam
+    imports."""
     calls: dict[str, Any] = {}
     if image_features is None:
         image_features = {"observation.images.front": SimpleNamespace(shape=(3, 4, 4))}
@@ -222,14 +230,19 @@ def _install_lerobot_fakes(
         def eval(self) -> None:
             calls["eval"] = True
 
-        def predict_action_chunk(self, batch: Any) -> FakeTensor:
+        def supports_rtc(self) -> bool:
+            return supports_rtc
+
+        def predict_action_chunk(self, batch: Any, **kw: Any) -> FakeTensor:
             calls["predict_batch"] = batch
+            calls.setdefault("predict_kwargs", []).append(kw)
             return FakeTensor(chunk)
 
     class _FakePolicyClass:
         @staticmethod
-        def from_pretrained(path: str) -> _FakePolicy:
+        def from_pretrained(path: str, **kw: Any) -> _FakePolicy:
             calls["from_pretrained"] = path
+            calls["from_pretrained_kwargs"] = kw
             return _FakePolicy()
 
     def get_policy_class(name: str) -> type[_FakePolicyClass]:
@@ -249,19 +262,48 @@ def _install_lerobot_fakes(
             calls.setdefault("postprocessed", []).append(tensor)
             return tensor
 
+        preprocessor.steps = [  # type: ignore[attr-defined]
+            SimpleNamespace(),
+            SimpleNamespace(rename_map=rename_map or {}),
+        ]
         return preprocessor, postprocessor
 
-    def hw_to_dataset_features(hw: Any, prefix: str, use_video: bool = True) -> Any:
-        calls["hw_features"] = hw
-        calls["hw_prefix"] = prefix
-        calls["hw_use_video"] = use_video
-        return {"observation.state": {"names": [k for k in hw if k.endswith(".pos")]}}
+    class _PeftConfig:
+        base_model_name_or_path = "base/model"
+        revision = "abc123"
 
-    def raw_observation_to_observation(raw: Any, feats: Any, img_feats: Any) -> Any:
-        calls["raw_obs"] = raw
-        calls["raw_features"] = feats
-        calls["raw_image_features"] = img_feats
-        return {"prepared": True}
+        @staticmethod
+        def from_pretrained(path: str) -> _PeftConfig:
+            calls["peft_config_path"] = path
+            return _PeftConfig()
+
+    class _PeftModel:
+        @staticmethod
+        def from_pretrained(base: Any, path: str, config: Any) -> Any:
+            calls["peft_model"] = (base, path, config)
+            return base
+
+    class _PreTrainedConfig:
+        @staticmethod
+        def from_pretrained(path: str) -> SimpleNamespace:
+            calls["pretrained_config_path"] = path
+            return SimpleNamespace(path=path)
+
+    def file_exists(repo: str, filename: str) -> bool:
+        calls["hub_file_exists"] = (repo, filename)
+        return hub_adapter
+
+    peft = ModuleType("peft")
+    peft.PeftConfig = _PeftConfig  # type: ignore[attr-defined]
+    peft.PeftModel = _PeftModel  # type: ignore[attr-defined]
+    hub = ModuleType("huggingface_hub")
+    hub.file_exists = file_exists  # type: ignore[attr-defined]
+    configs = ModuleType("lerobot.configs")
+    configs_policies = ModuleType("lerobot.configs.policies")
+    configs_policies.PreTrainedConfig = _PreTrainedConfig  # type: ignore[attr-defined]
+    rtc = ModuleType("lerobot.policies.rtc")
+    rtc_config = ModuleType("lerobot.policies.rtc.configuration_rtc")
+    rtc_config.RTCConfig = lambda **kw: SimpleNamespace(**kw)  # type: ignore[attr-defined]
 
     torch_mod = ModuleType("torch")
     torch_mod.no_grad = nullcontext  # type: ignore[attr-defined]
@@ -270,63 +312,30 @@ def _install_lerobot_fakes(
         return FakeTensor(np.stack([t.arr for t in tensors], axis=dim))
 
     torch_mod.stack = _stack  # type: ignore[attr-defined]
+    torch_mod.from_numpy = lambda arr: arr  # type: ignore[attr-defined]
 
     lerobot = ModuleType("lerobot")
     policies = ModuleType("lerobot.policies")
     factory = ModuleType("lerobot.policies.factory")
     factory.get_policy_class = get_policy_class  # type: ignore[attr-defined]
     factory.make_pre_post_processors = make_pre_post_processors  # type: ignore[attr-defined]
-    async_inference = ModuleType("lerobot.async_inference")
-    helpers = ModuleType("lerobot.async_inference.helpers")
-    helpers.raw_observation_to_observation = raw_observation_to_observation  # type: ignore[attr-defined]
-    datasets = ModuleType("lerobot.datasets")
     lerobot.policies = policies  # type: ignore[attr-defined]
     policies.factory = factory  # type: ignore[attr-defined]
-    lerobot.async_inference = async_inference  # type: ignore[attr-defined]
-    async_inference.helpers = helpers  # type: ignore[attr-defined]
-    lerobot.datasets = datasets  # type: ignore[attr-defined]
+    lerobot.configs = configs  # type: ignore[attr-defined]
+    configs.policies = configs_policies  # type: ignore[attr-defined]
 
     modules = {
         "torch": torch_mod,
+        "peft": peft,
+        "huggingface_hub": hub,
+        "lerobot.configs": configs,
+        "lerobot.configs.policies": configs_policies,
         "lerobot": lerobot,
         "lerobot.policies": policies,
         "lerobot.policies.factory": factory,
-        "lerobot.async_inference": async_inference,
-        "lerobot.async_inference.helpers": helpers,
-        "lerobot.datasets": datasets,
+        "lerobot.policies.rtc": rtc,
+        "lerobot.policies.rtc.configuration_rtc": rtc_config,
     }
-    if feature_layout == "v060":
-        # lerobot >= 0.6.0: hw_to_dataset_features lives in lerobot.utils.feature_utils.
-        monkeypatch.delitem(sys.modules, "lerobot.datasets.feature_utils", raising=False)
-        monkeypatch.delitem(sys.modules, "lerobot.datasets.utils", raising=False)
-        utils = ModuleType("lerobot.utils")
-        feature_utils_mod = ModuleType("lerobot.utils.feature_utils")
-        feature_utils_mod.hw_to_dataset_features = hw_to_dataset_features  # type: ignore[attr-defined]
-        utils.feature_utils = feature_utils_mod  # type: ignore[attr-defined]
-        lerobot.utils = utils  # type: ignore[attr-defined]
-        modules["lerobot.utils"] = utils
-        modules["lerobot.utils.feature_utils"] = feature_utils_mod
-    elif feature_layout == "v051":
-        # lerobot 0.5.1 - 0.5.x: the helper moved to datasets.feature_utils.
-        monkeypatch.delitem(sys.modules, "lerobot.utils.feature_utils", raising=False)
-        monkeypatch.delitem(sys.modules, "lerobot.utils", raising=False)
-        feature_utils_mod = ModuleType("lerobot.datasets.feature_utils")
-        feature_utils_mod.hw_to_dataset_features = hw_to_dataset_features  # type: ignore[attr-defined]
-        datasets.feature_utils = feature_utils_mod  # type: ignore[attr-defined]
-        modules["lerobot.datasets.feature_utils"] = feature_utils_mod
-    elif feature_layout == "v050":
-        # lerobot == 0.5.0 layout: hw_to_dataset_features in lerobot.datasets.utils
-        # and NO feature_utils module (the import must raise ImportError).
-        monkeypatch.delitem(sys.modules, "lerobot.utils.feature_utils", raising=False)
-        monkeypatch.delitem(sys.modules, "lerobot.utils", raising=False)
-        monkeypatch.delitem(sys.modules, "lerobot.datasets.feature_utils", raising=False)
-        utils_mod = ModuleType("lerobot.datasets.utils")
-        utils_mod.hw_to_dataset_features = hw_to_dataset_features  # type: ignore[attr-defined]
-        datasets.utils = utils_mod  # type: ignore[attr-defined]
-        modules["lerobot.datasets.utils"] = utils_mod
-    else:
-        raise ValueError(f"unknown feature layout: {feature_layout}")
-
     for name, mod in modules.items():
         monkeypatch.setitem(sys.modules, name, mod)
     return calls
@@ -346,6 +355,8 @@ def test_default_predict_wires_lerobot(monkeypatch: pytest.MonkeyPatch) -> None:
     # Model load: factory class + from_pretrained + device + eval.
     assert calls["policy_types"] == ["smolvla"]
     assert calls["from_pretrained"] == "lerobot/smolvla_base"
+    assert calls["hub_file_exists"] == ("lerobot/smolvla_base", "adapter_config.json")
+    assert "peft_model" not in calls
     assert calls["to_device"] == "cpu"
     assert calls["eval"] is True
     # Processor pipelines built from the loaded policy's config with device overrides.
@@ -355,24 +366,15 @@ def test_default_predict_wires_lerobot(monkeypatch: pytest.MonkeyPatch) -> None:
         "preprocessor_overrides": {"device_processor": {"device": "cpu"}},
         "postprocessor_overrides": {"device_processor": {"device": "cpu"}},
     }
-    # lerobot_features synthesized from packing.MOTORS + cfg cameras (no robot object).
-    hw = calls["hw_features"]
-    assert [k for k in hw if k.endswith(".pos")] == list(packing.motor_keys())
-    assert all(hw[k] is float for k in packing.motor_keys())
-    assert hw["front"] == (4, 4, 3)
-    assert calls["hw_prefix"] == "observation"
-    assert calls["hw_use_video"] is False
-    # Obs prep delegated to lerobot's raw_observation_to_observation with the raw
-    # payload, the synthesized features, and the checkpoint's image features.
-    raw = calls["raw_obs"]
-    assert raw["task"] == "grab it"
-    assert [raw[k] for k in packing.motor_keys()] == [0.0] * 6
-    assert raw["front"].shape == (4, 4, 3)
-    assert calls["raw_features"] == {"observation.state": {"names": list(packing.motor_keys())}}
-    assert calls["raw_image_features"] == calls["policy_config"].image_features
-    # Prepared obs -> preprocessor -> predict_action_chunk -> per-step postprocess.
-    assert calls["preprocessed"] == {"prepared": True}
-    assert calls["predict_batch"] == {"batch": {"prepared": True}}
+    # The raw payload packed into the batch the preprocessor takes: state in motor
+    # order, each camera as float CHW in 0..1 under observation.images.<cam>, task.
+    batch = calls["preprocessed"]
+    assert batch["task"] == "grab it"
+    assert batch["observation.state"].shape == (1, 6)
+    assert batch["observation.state"].dtype == np.float32
+    image = batch["observation.images.front"]
+    assert image.shape == (1, 3, 4, 4) and image.dtype == np.float32
+    assert calls["predict_batch"] == {"batch": batch}
     assert len(calls["postprocessed"]) == 2
     assert len(out) == 2
     assert np.array_equal(out.actions[0].data, chunk[0, 0])
@@ -399,6 +401,16 @@ def test_default_predict_built_once(monkeypatch: pytest.MonkeyPatch) -> None:
     assert pol.num_inferences == 2
 
 
+def test_bind_task_loads_before_the_first_trial(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _install_lerobot_fakes(monkeypatch, chunk=np.ones((1, 2, 6)))
+    pol = LeRobotPolicy(_seam_cfg())
+    pol.bind_task(TaskEnvelope(name="t", max_steps=10))
+    assert calls["policy_types"] == ["smolvla"]
+    pol.reset(Scene(id="s", instruction="x"))
+    pol.act(_obs())
+    assert calls["policy_types"] == ["smolvla"]  # not loaded again
+
+
 def test_default_predict_rejects_camera_feature_mismatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -413,27 +425,105 @@ def test_default_predict_rejects_camera_feature_mismatch(
         pol.act(_obs())
 
 
-def test_default_predict_hw_features_fallback_import(monkeypatch: pytest.MonkeyPatch) -> None:
-    # lerobot 0.5.0 layout: no lerobot.datasets.feature_utils -> fall back to
-    # lerobot.datasets.utils.
-    calls = _install_lerobot_fakes(monkeypatch, chunk=np.ones((1, 2, 6)), feature_layout="v050")
-    pol = LeRobotPolicy(_seam_cfg())
-    pol.reset(Scene(id="s", instruction="x"))
-    out = pol.act(_obs())
-    assert len(out) == 2
-    assert calls["hw_prefix"] == "observation"
-
-
-def test_default_predict_hw_features_v051_fallback_import(
-    monkeypatch: pytest.MonkeyPatch,
+def test_default_predict_loads_adapter_onto_base(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
 ) -> None:
-    calls = _install_lerobot_fakes(
+    (tmp_path / "adapter_config.json").write_text("{}")
+    calls = _install_lerobot_fakes(monkeypatch, chunk=np.ones((1, 2, 6)))
+    pol = LeRobotPolicy(_seam_cfg(pretrained_path=str(tmp_path)))
+    pol.reset(Scene(id="s", instruction="x"))
+    pol.act(_obs())
+    # The base weights the adapter names, under the fine-tuned checkpoint's config.
+    assert calls["from_pretrained"] == "base/model"
+    assert calls["from_pretrained_kwargs"] == {
+        "config": SimpleNamespace(path=str(tmp_path)),
+        "revision": "abc123",
+    }
+    _, path, _ = calls["peft_model"]
+    assert path == str(tmp_path)
+    assert calls["processors_path"] == str(tmp_path)
+
+
+def test_default_predict_local_dir_without_adapter(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    calls = _install_lerobot_fakes(monkeypatch, chunk=np.ones((1, 2, 6)))
+    pol = LeRobotPolicy(_seam_cfg(pretrained_path=str(tmp_path)))
+    pol.reset(Scene(id="s", instruction="x"))
+    pol.act(_obs())
+    assert calls["from_pretrained"] == str(tmp_path)
+    assert "hub_file_exists" not in calls and "peft_model" not in calls
+
+
+def test_default_predict_detects_hub_adapter(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _install_lerobot_fakes(monkeypatch, chunk=np.ones((1, 2, 6)), hub_adapter=True)
+    pol = LeRobotPolicy(_seam_cfg(pretrained_path="me/adapter"))
+    pol.reset(Scene(id="s", instruction="x"))
+    pol.act(_obs())
+    assert calls["peft_config_path"] == "me/adapter"
+    assert calls["from_pretrained"] == "base/model"
+
+
+def test_default_predict_accepts_renamed_cameras(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The checkpoint calls the camera "base_0_rgb"; its preprocessor renames "front".
+    _install_lerobot_fakes(
         monkeypatch,
         chunk=np.ones((1, 2, 6)),
-        feature_layout="v051",
+        image_features={"observation.images.base_0_rgb": SimpleNamespace(shape=(3, 4, 4))},
+        rename_map={"observation.images.front": "observation.images.base_0_rgb"},
     )
     pol = LeRobotPolicy(_seam_cfg())
     pol.reset(Scene(id="s", instruction="x"))
-    out = pol.act(_obs())
-    assert len(out) == 2
-    assert calls["hw_prefix"] == "observation"
+    assert len(pol.act(_obs())) == 2
+
+
+def test_default_predict_stitches_chunks_with_rtc(monkeypatch: pytest.MonkeyPatch) -> None:
+    chunk = np.arange(1 * 5 * 6, dtype=float).reshape(1, 5, 6)
+    calls = _install_lerobot_fakes(monkeypatch, chunk=chunk)
+    pol = LeRobotPolicy(_seam_cfg(rtc=True, chunk_size=2))
+    pol.reset(Scene(id="s", instruction="x"))
+    assert len(pol.act(_obs())) == 2
+    pol.act(_obs())
+    # The checkpoint's config is built with RTC over the executed horizon.
+    assert calls["from_pretrained_kwargs"]["config"].rtc_config.execution_horizon == 2
+    first, second = calls["predict_kwargs"]
+    assert first == {"prev_chunk_left_over": None, "inference_delay": 0, "execution_horizon": 2}
+    # The next chunk is guided onto the three actions the first one left unexecuted.
+    assert np.array_equal(second["prev_chunk_left_over"].arr, chunk[:, 2:])
+    # A new trial starts unguided.
+    pol.reset(Scene(id="t", instruction="x"))
+    pol.act(_obs())
+    assert calls["predict_kwargs"][2]["prev_chunk_left_over"] is None
+
+
+def test_default_predict_without_rtc_passes_no_guidance(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _install_lerobot_fakes(monkeypatch, chunk=np.ones((1, 2, 6)))
+    pol = LeRobotPolicy(_seam_cfg())
+    pol.reset(Scene(id="s", instruction="x"))
+    pol.act(_obs())
+    assert calls["predict_kwargs"] == [{}]
+
+
+def test_default_predict_rejects_rtc_without_support(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_lerobot_fakes(monkeypatch, chunk=np.ones((1, 2, 6)), supports_rtc=False)
+    pol = LeRobotPolicy(_seam_cfg(rtc=True))
+    pol.reset(Scene(id="s", instruction="x"))
+    with pytest.raises(ValueError, match="needs a policy that supports RTC"):
+        pol.act(_obs())
+
+
+def test_smooth_reads_the_whole_chunk_off_the_cubic_before_truncating() -> None:
+    chunk = np.random.default_rng(0).normal(size=(50, 6))
+    pol = LeRobotPolicy(_policy_cfg(smooth=True, chunk_size=10), predict_fn=lambda obs: chunk)
+    pol.reset(Scene(id="s", instruction="x"))
+    out = np.array([a.data for a in pol.act(_obs()).actions])
+    assert pol.config.smooth is True
+    assert np.allclose(out, smooth(chunk)[:10])
+
+
+def test_smooth_off_executes_the_chunk_as_predicted() -> None:
+    chunk = np.random.default_rng(0).normal(size=(50, 6))
+    pol = LeRobotPolicy(_policy_cfg(smooth=False, chunk_size=10), predict_fn=lambda obs: chunk)
+    pol.reset(Scene(id="s", instruction="x"))
+    out = np.array([a.data for a in pol.act(_obs()).actions])
+    assert np.array_equal(out, chunk[:10])

@@ -52,10 +52,21 @@ class _FromKwargs:
 
     @classmethod
     def from_kwargs(cls: type[_T], **flat: Any) -> _T:
-        names = {f.name for f in dataclasses.fields(cls)}  # type: ignore[arg-type]
-        unknown = set(flat) - names
+        """Build the config from CLI scalars.
+
+        A tuple field given a string takes it as comma-separated items, each cast to
+        the type of the default's items (``cameras=top,wrist``,
+        ``joint_low=-90,-90,-90,-90,-90,0``).
+        """
+        fields = {f.name: f for f in dataclasses.fields(cls)}  # type: ignore[arg-type]
+        unknown = set(flat) - set(fields)
         if unknown:
             raise TypeError(f"{cls.__name__} got unexpected config keys: {sorted(unknown)}")
+        for name, value in flat.items():
+            default = fields[name].default
+            if isinstance(default, tuple) and isinstance(value, str):
+                item = type(default[0]) if default else str
+                flat[name] = tuple(item(v.strip()) for v in value.split(",") if v.strip())
         return cls(**flat)
 
 
@@ -180,6 +191,13 @@ class LeRobotPolicyConfig(_FromKwargs):
     # Must match SOArmConfig.use_degrees so the policy's declared observation
     # contract reflects the motor positions it receives.
     use_degrees: bool = True
+    # Stitch each chunk onto the unexecuted tail of the one before it with Real-Time
+    # Chunking, guiding the next denoise over ``chunk_size`` steps. Needs a policy whose
+    # ``supports_rtc()`` is true (pi0, pi0.5, SmolVLA).
+    rtc: bool = False
+    # Read each whole chunk back off a shape-preserving cubic through some of its steps
+    # before truncating it, which drops the step-to-step wobble (see ``smoothing``).
+    smooth: bool = True
 
     def __post_init__(self) -> None:
         if self.chunk_size < 1:

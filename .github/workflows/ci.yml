@@ -60,7 +60,7 @@ jobs:
   # Real-import guard for the lazily-imported lerobot seam. The unit tests fake
   # these modules (sys.modules), so only this job catches upstream drift in the
   # import paths / symbols the seam code relies on (lerobot.policies.factory,
-  # lerobot.async_inference.helpers, lerobot.datasets.*, the SO follower driver).
+  # the SO follower driver).
   # lerobot needs Python >= 3.12; UV_TORCH_BACKEND=cpu avoids the multi-GB CUDA torch.
   lerobot-seam:
     name: lerobot seam imports (py3.12)
@@ -87,33 +87,25 @@ jobs:
           # Exactly the imports the lazy seams perform at runtime.
           import torch
 
-          from lerobot.async_inference.helpers import raw_observation_to_observation
+          from huggingface_hub import file_exists
+          from lerobot.configs.policies import PreTrainedConfig
           from lerobot.policies.factory import get_policy_class, make_pre_post_processors
+          from lerobot.policies.rtc.configuration_rtc import RTCConfig
+          from peft import PeftConfig, PeftModel
           from lerobot.robots.so_follower import SOFollower
           from lerobot.robots.so_follower.config_so_follower import SOFollowerRobotConfig
 
-          from inspect_robots_so101.config import LeRobotPolicyConfig, SOArmConfig
-          from inspect_robots_so101.policy import (
-              _hw_observation_features,
-              _import_hw_to_dataset_features,
-          )
-
-          # The version-tolerant import must resolve against the installed lerobot.
-          hw_to_dataset_features = _import_hw_to_dataset_features()
+          from inspect_robots_so101.config import SOArmConfig
 
           # Construct the config objects the seams construct (no hardware touched).
-          policy_cfg = LeRobotPolicyConfig()
           arm_cfg = SOArmConfig()
           robot_cfg = SOFollowerRobotConfig(port=arm_cfg.port)
-          features = hw_to_dataset_features(
-              _hw_observation_features(policy_cfg), "observation", use_video=False
-          )
-          assert "observation.state" in features, features
           print("lerobot seam OK:", torch.__version__)
           print("  get_policy_class:", get_policy_class)
           print("  make_pre_post_processors:", make_pre_post_processors)
-          print("  raw_observation_to_observation:", raw_observation_to_observation)
-          print("  hw_to_dataset_features:", hw_to_dataset_features)
+          print("  PreTrainedConfig:", PreTrainedConfig, "| peft:", PeftConfig, PeftModel)
+          print("  file_exists:", file_exists)
+          print("  RTCConfig:", RTCConfig(execution_horizon=10))
           print("  SOFollower:", SOFollower, "| config:", type(robot_cfg).__name__)
           PY
 

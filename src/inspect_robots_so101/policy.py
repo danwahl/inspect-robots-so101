@@ -9,12 +9,12 @@ a library you import — so the heavy, GPU-bound dependencies (``torch`` +
 floats, camera frames keyed by camera name, and ``"task"``) to an action chunk.
 
 The default ``predict_fn`` (``_default_predict``) lazily builds the policy and its
-pre/post-processors from a pretrained path and prepares each observation with
-lerobot's own ``raw_observation_to_observation`` helper — the same path
-``lerobot.async_inference.policy_server`` uses — so torch conversion, HWC→CHW,
-0..1 scaling, resizing, and batching stay lerobot's job, not ours. Tests exercise
-this wiring with ``sys.modules`` fakes (no torch, no lerobot, no network), and the
-``lerobot-seam`` CI job re-imports the real symbols on Python 3.12 to catch
+pre/post-processors from a pretrained path and packs each observation into the batch
+those processors expect: ``observation.state`` in motor order,
+``observation.images.<cam>`` as float CHW in 0..1, and ``task``. Images go at the
+camera's resolution; the checkpoint's own processors and model resize them. Tests
+exercise this wiring with ``sys.modules`` fakes (no torch, no lerobot, no network),
+and the ``lerobot-seam`` CI job re-imports the real symbols on Python 3.12 to catch
 upstream drift. ``import inspect_robots_so101`` never imports torch.
 
 The action chunk this policy returns is already in the robot's **native motor
@@ -27,81 +27,162 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 import numpy.typing as npt
 from inspect_robots.policy import PolicyConfig, PolicyInfo
 from inspect_robots.scene import Scene
+from inspect_robots.task import TaskEnvelope
 from inspect_robots.types import Action, ActionChunk, Observation
 
 from inspect_robots_so101 import packing
 from inspect_robots_so101.config import LeRobotPolicyConfig, action_box, observation_space
+from inspect_robots_so101.smoothing import smooth
 
 # A RAW robot-style observation dict -> an (N, action_dim) action-chunk array.
 # Keys: "<motor>.pos" floats (packing.motor_keys()), camera frames keyed by the
 # camera name, and "task" (the instruction) — exactly what a lerobot Robot's
-# get_observation() returns, plus the task string. The default predict_fn feeds
-# this to lerobot's raw_observation_to_observation, which packs it into
-# "observation.state" / "observation.images.<cam>" tensors itself.
+# get_observation() returns, plus the task string. The default predict_fn packs it
+# into "observation.state" / "observation.images.<cam>" itself.
 LeRobotObs = Mapping[str, Any]
 PredictFn = Callable[[LeRobotObs], npt.NDArray[np.floating[Any]]]
 
 # LeRobot key conventions (see lerobot/utils/constants.py). Hardcoded so this
 # module needs no lerobot import.
-OBS_STR = "observation"
+OBS_STATE = "observation.state"
 OBS_IMAGE_PREFIX = "observation.images."
 TASK_KEY = "task"
+# What PEFT saves beside a LoRA adapter's weights.
+ADAPTER_CONFIG = "adapter_config.json"
 
 
-def _import_hw_to_dataset_features() -> Callable[..., dict[str, Any]]:
-    """Import lerobot's ``hw_to_dataset_features`` across supported versions.
+def _batch(obs: LeRobotObs, cameras: tuple[str, ...]) -> dict[str, Any]:
+    """Pack the raw payload into the unprocessed batch a LeRobot preprocessor takes.
 
-    lerobot moved it from ``lerobot.datasets.utils`` (v0.5.0) to
-    ``lerobot.datasets.feature_utils`` (v0.5.1) to
-    ``lerobot.utils.feature_utils`` (v0.6.0); the ``lerobot-seam`` CI job
-    guards this against further drift.
+    State is ``(1, 6)`` float32 in motor order; each camera becomes
+    ``observation.images.<cam>``, ``(1, 3, H, W)`` float32 in 0..1.
     """
-    try:
-        from lerobot.utils.feature_utils import hw_to_dataset_features
-    except ImportError:
-        try:  # lerobot 0.5.1 - 0.5.x
-            from lerobot.datasets.feature_utils import hw_to_dataset_features
-        except ImportError:  # lerobot == 0.5.0
-            from lerobot.datasets.utils import hw_to_dataset_features
-    return hw_to_dataset_features  # type: ignore[no-any-return]
+    state = np.asarray([obs[k] for k in packing.motor_keys()], dtype=np.float32)[None]
+    batch: dict[str, Any] = {OBS_STATE: state, TASK_KEY: obs[TASK_KEY]}
+    for cam in cameras:
+        image = np.asarray(obs[cam], dtype=np.float32).transpose(2, 0, 1)[None] / 255.0
+        batch[f"{OBS_IMAGE_PREFIX}{cam}"] = np.ascontiguousarray(image)
+    return batch
 
 
-def _hw_observation_features(cfg: LeRobotPolicyConfig) -> dict[str, Any]:
-    """Reconstruct the SO follower's ``observation_features`` mapping.
+def _has_adapter(path: str) -> bool:
+    """Whether the checkpoint at ``path`` (a local directory or a Hub repo) is a PEFT adapter."""
+    if Path(path).is_dir():
+        return (Path(path) / ADAPTER_CONFIG).is_file()
+    from huggingface_hub import file_exists
 
-    The policy never holds a lerobot ``Robot`` object (the embodiment owns the
-    driver), so we synthesize the same mapping the driver would report —
-    ``"<motor>.pos" -> float`` for each motor in canonical order plus
-    ``"<camera>" -> (height, width, 3)`` for each configured camera — for
-    ``hw_to_dataset_features`` to turn into lerobot dataset features.
+    return bool(file_exists(path, ADAPTER_CONFIG))
+
+
+def _load_policy(cfg: LeRobotPolicyConfig) -> Any:
+    """The checkpoint's policy, with its LoRA adapter applied if it is one.
+
+    An adapter is loaded the way ``lerobot.policies.factory.make_policy`` loads one:
+    the base weights its ``adapter_config.json`` names, built under the fine-tuned
+    checkpoint's own config, then the adapter on top. ``cfg.rtc`` sets that config's
+    ``rtc_config`` first, since a policy builds its RTC processor at construction.
     """
-    features: dict[str, Any] = dict.fromkeys(packing.motor_keys(), float)
-    for cam in cfg.cameras:
-        features[cam] = (cfg.cam_height, cfg.cam_width, 3)
-    return features
+    from lerobot.policies.factory import get_policy_class
+
+    policy_cls = get_policy_class(cfg.policy_type)
+    adapter = _has_adapter(cfg.pretrained_path)
+    if not adapter and not cfg.rtc:
+        return policy_cls.from_pretrained(cfg.pretrained_path)
+    from lerobot.configs.policies import PreTrainedConfig
+
+    config = PreTrainedConfig.from_pretrained(cfg.pretrained_path)
+    if cfg.rtc:
+        from lerobot.policies.rtc.configuration_rtc import RTCConfig
+
+        config.rtc_config = RTCConfig(execution_horizon=cfg.chunk_size)
+    if not adapter:
+        return policy_cls.from_pretrained(cfg.pretrained_path, config=config)
+    from peft import PeftConfig, PeftModel
+
+    peft_config = PeftConfig.from_pretrained(cfg.pretrained_path)
+    base = policy_cls.from_pretrained(
+        peft_config.base_model_name_or_path,
+        config=config,
+        revision=peft_config.revision,
+    )
+    return PeftModel.from_pretrained(base, cfg.pretrained_path, config=peft_config)
 
 
-def _default_predict(cfg: LeRobotPolicyConfig) -> PredictFn:
-    """Build an in-process LeRobot inference closure from a pretrained checkpoint.
+def _rename_map(preprocessor: Any) -> dict[str, str]:
+    """The observation renaming a checkpoint's saved preprocessor applies, if any."""
+    for step in getattr(preprocessor, "steps", ()):
+        rename = getattr(step, "rename_map", None)
+        if rename:
+            return dict(rename)
+    return {}
 
-    Mirrors ``lerobot.async_inference.policy_server``: load the policy class from
-    the factory, build the matching pre/post-processor pipelines, then per call
-    ``raw_observation_to_observation`` → preprocess → ``predict_action_chunk`` →
-    postprocess back to native motor units.
+
+class _Inference:
+    """In-process LeRobot inference: pack the batch → preprocess →
+    ``predict_action_chunk`` → postprocess back to native motor units.
+
+    Under ``cfg.rtc`` it keeps the normalized tail of each chunk past the
+    ``chunk_size`` actions executed, and guides the next chunk onto it; ``reset``
+    drops that tail at the start of a trial.
     """
-    import torch
-    from lerobot.async_inference.helpers import raw_observation_to_observation
-    from lerobot.policies.factory import get_policy_class, make_pre_post_processors
 
-    hw_to_dataset_features = _import_hw_to_dataset_features()
+    def __init__(
+        self, cfg: LeRobotPolicyConfig, policy: Any, preprocessor: Any, postprocessor: Any
+    ):
+        self._cfg = cfg
+        self._policy = policy
+        self._preprocessor = preprocessor
+        self._postprocessor = postprocessor
+        self._leftover: Any = None
 
-    policy = get_policy_class(cfg.policy_type).from_pretrained(cfg.pretrained_path)
+    def reset(self) -> None:
+        self._leftover = None
+
+    def __call__(self, obs: LeRobotObs) -> npt.NDArray[np.floating[Any]]:
+        import torch
+
+        cfg = self._cfg
+        observation = {
+            k: torch.from_numpy(v) if isinstance(v, np.ndarray) else v
+            for k, v in _batch(obs, cfg.cameras).items()
+        }
+        batch = self._preprocessor(observation)
+        with torch.no_grad():
+            if cfg.rtc:
+                chunk = self._policy.predict_action_chunk(
+                    batch,
+                    prev_chunk_left_over=self._leftover,
+                    inference_delay=0,
+                    execution_horizon=cfg.chunk_size,
+                )
+            else:
+                chunk = self._policy.predict_action_chunk(batch)
+        if chunk.ndim == 2:
+            chunk = chunk.unsqueeze(0)
+        if cfg.rtc:
+            self._leftover = chunk[:, cfg.chunk_size :]
+        out = torch.stack(
+            [self._postprocessor(chunk[:, i, :]) for i in range(chunk.shape[1])], dim=1
+        ).squeeze(0)
+        return out.detach().cpu().numpy()  # type: ignore[no-any-return]
+
+
+def _default_predict(cfg: LeRobotPolicyConfig) -> _Inference:
+    """Build in-process LeRobot inference from a pretrained checkpoint: the policy from
+    the factory and the pre/post-processor pipelines saved beside it."""
+    from lerobot.policies.factory import make_pre_post_processors
+
+    policy = _load_policy(cfg)
+    if cfg.rtc and not policy.supports_rtc():
+        raise ValueError(f"rtc=true needs a policy that supports RTC; {cfg.policy_type!r} does not")
     policy.to(cfg.device)
     policy.eval()  # torch nn.Module inference mode (not Python's eval builtin)
     preprocessor, postprocessor = make_pre_post_processors(
@@ -111,15 +192,15 @@ def _default_predict(cfg: LeRobotPolicyConfig) -> PredictFn:
         postprocessor_overrides={"device_processor": {"device": cfg.device}},
     )
 
-    # The dataset-feature spec raw_observation_to_observation uses to pack raw
-    # "<motor>.pos" keys into "observation.state" and camera frames into
-    # "observation.images.<cam>" (use_video=False: these are live frames).
-    lerobot_features = hw_to_dataset_features(
-        _hw_observation_features(cfg), OBS_STR, use_video=False
-    )
+    # A checkpoint trained under a rename_map keeps the policy-side names in its
+    # config and renames the cameras in its saved preprocessor.
+    rename = _rename_map(preprocessor)
     policy_image_features = dict(policy.config.image_features)
     missing = [
-        cam for cam in cfg.cameras if f"{OBS_IMAGE_PREFIX}{cam}" not in policy_image_features
+        cam
+        for cam in cfg.cameras
+        if rename.get(f"{OBS_IMAGE_PREFIX}{cam}", f"{OBS_IMAGE_PREFIX}{cam}")
+        not in policy_image_features
     ]
     if missing:
         raise ValueError(
@@ -128,22 +209,16 @@ def _default_predict(cfg: LeRobotPolicyConfig) -> PredictFn:
             f"{missing} (expected {[OBS_IMAGE_PREFIX + cam for cam in missing]}); "
             "set LeRobotPolicyConfig.cameras to the camera names the checkpoint expects"
         )
+    return _Inference(cfg, policy, preprocessor, postprocessor)
 
-    def _predict(obs: LeRobotObs) -> npt.NDArray[np.floating[Any]]:
-        observation = raw_observation_to_observation(
-            dict(obs), lerobot_features, policy_image_features
-        )
-        batch = preprocessor(observation)
-        with torch.no_grad():
-            chunk = policy.predict_action_chunk(batch)
-        if chunk.ndim == 2:
-            chunk = chunk.unsqueeze(0)
-        out = torch.stack(
-            [postprocessor(chunk[:, i, :]) for i in range(chunk.shape[1])], dim=1
-        ).squeeze(0)
-        return out.detach().cpu().numpy()  # type: ignore[no-any-return]
 
-    return _predict
+@dataclass(frozen=True)
+class LeRobotInferenceConfig(PolicyConfig):
+    """``PolicyConfig`` plus the inference settings it has no field for. ``eval()``
+    records the policy config in the log, so these land there too."""
+
+    rtc: bool = False
+    smooth: bool = True
 
 
 class LeRobotPolicy:
@@ -172,8 +247,11 @@ class LeRobotPolicy:
             # Intentionally None: advertising a rate would trip a (harmless) compat
             # control_rate warning. The embodiment paces the rollout.
             control_hz=None,
+            checkpoint=self._cfg.pretrained_path,
         )
-        self.config = PolicyConfig(action_horizon=self._cfg.chunk_size)
+        self.config = LeRobotInferenceConfig(
+            action_horizon=self._cfg.chunk_size, rtc=self._cfg.rtc, smooth=self._cfg.smooth
+        )
 
     def _predict(self) -> PredictFn:
         """Lazily build the real inference closure on first use."""
@@ -181,15 +259,26 @@ class LeRobotPolicy:
             self._predict_fn = _default_predict(self._cfg)
         return self._predict_fn
 
+    def bind_task(self, envelope: TaskEnvelope) -> None:
+        """Load the checkpoint before the first trial, so one that cannot load fails
+        the run once instead of erroring every trial. ``eval()`` calls this; a direct
+        ``rollout()`` loads on the first ``act``."""
+        self._predict()
+
     def reset(self, scene: Scene) -> None:
-        """Stash the scene's instruction (fed to the VLA verbatim)."""
+        """Stash the scene's instruction (fed to the VLA verbatim), and drop any chunk
+        a stitching predict_fn carries over from the last trial."""
         self._instruction = scene.instruction
         self.num_inferences = 0
+        reset = getattr(self._predict_fn, "reset", None)
+        if reset is not None:
+            reset()
 
     def act(self, observation: Observation) -> ActionChunk:
         """Build the raw robot-style observation, run inference, return the chunk.
 
-        The chunk is truncated to the first ``chunk_size`` actions (see
+        The chunk is smoothed whole under ``smooth``, so the actions executed sit inside
+        the curve, then truncated to the first ``chunk_size`` actions (see
         ``LeRobotPolicyConfig.chunk_size``).
         """
         cfg = self._cfg
@@ -205,8 +294,8 @@ class LeRobotPolicy:
             raise ValueError(f"observation missing state key {cfg.state_key!r}")
         state = packing.validate_dim(observation.state[cfg.state_key])
 
-        # The raw robot format lerobot's raw_observation_to_observation expects:
-        # "<motor>.pos" floats, camera frames keyed by camera name, and "task".
+        # The raw robot format: "<motor>.pos" floats, camera frames keyed by camera
+        # name, and "task".
         lerobot_obs: dict[str, Any] = {
             **packing.to_action_dict(state),
             TASK_KEY: self._instruction or "",
@@ -225,6 +314,8 @@ class LeRobotPolicy:
             )
         if actions.shape[0] == 0:
             raise ValueError("policy returned an empty action chunk")
+        if cfg.smooth:
+            actions = smooth(actions)
         actions = actions[: cfg.chunk_size]
 
         self.num_inferences += 1

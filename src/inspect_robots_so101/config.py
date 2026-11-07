@@ -197,7 +197,7 @@ class LeRobotPolicyConfig(_FromKwargs):
     rtc: bool = False
     # Read each whole chunk back off a shape-preserving cubic through some of its steps
     # before truncating it, which drops the step-to-step wobble (see ``smoothing``).
-    smooth: bool = False
+    smooth: bool = True
 
     def __post_init__(self) -> None:
         if self.chunk_size < 1:

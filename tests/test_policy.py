@@ -65,7 +65,7 @@ def test_info_and_config_zero_arg() -> None:
     assert pol.info.observation_space.state_keys == frozenset({"joint_pos"})
     assert pol.config.action_horizon == 50
     assert pol.config.rtc is False
-    assert pol.config.smooth is False
+    assert pol.config.smooth is True
     assert pol.info.checkpoint == "lerobot/smolvla_base"
 
 
@@ -519,3 +519,11 @@ def test_smooth_reads_the_whole_chunk_off_the_cubic_before_truncating() -> None:
     out = np.array([a.data for a in pol.act(_obs()).actions])
     assert pol.config.smooth is True
     assert np.allclose(out, smooth(chunk)[:10])
+
+
+def test_smooth_off_executes_the_chunk_as_predicted() -> None:
+    chunk = np.random.default_rng(0).normal(size=(50, 6))
+    pol = LeRobotPolicy(_policy_cfg(smooth=False, chunk_size=10), predict_fn=lambda obs: chunk)
+    pol.reset(Scene(id="s", instruction="x"))
+    out = np.array([a.data for a in pol.act(_obs()).actions])
+    assert np.array_equal(out, chunk[:10])

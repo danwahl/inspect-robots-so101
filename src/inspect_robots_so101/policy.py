@@ -218,7 +218,7 @@ class LeRobotInferenceConfig(PolicyConfig):
     records the policy config in the log, so these land there too."""
 
     rtc: bool = False
-    smooth: bool = False
+    smooth: bool = True
 
 
 class LeRobotPolicy:
